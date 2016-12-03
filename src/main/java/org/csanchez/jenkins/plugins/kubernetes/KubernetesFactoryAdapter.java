@@ -15,6 +15,7 @@ import jenkins.model.Jenkins;
 import org.apache.commons.codec.binary.Base64;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.security.Key;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
@@ -23,6 +24,7 @@ import java.security.UnrecoverableKeyException;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.X509Certificate;
 import java.util.Collections;
+import java.util.concurrent.TimeUnit;
 
 import javax.annotation.CheckForNull;
 
@@ -31,20 +33,39 @@ import javax.annotation.CheckForNull;
  */
 public class KubernetesFactoryAdapter {
 
+    private static final int DEFAULT_CONNECT_TIMEOUT = 5;
+    private static final int DEFAULT_READ_TIMEOUT = 15;
+
     private final String serviceAddress;
+    private final String namespace;
     @CheckForNull
     private final String caCertData;
     @CheckForNull
     private final StandardCredentials credentials;
 
     private final boolean skipTlsVerify;
+    private final int connectTimeout;
+    private final int readTimeout;
 
     public KubernetesFactoryAdapter(String serviceAddress, @CheckForNull String caCertData,
                                     @CheckForNull String credentials, boolean skipTlsVerify) {
+        this(serviceAddress, null, caCertData, credentials, skipTlsVerify);
+    }
+
+    public KubernetesFactoryAdapter(String serviceAddress, String namespace, @CheckForNull String caCertData,
+                                    @CheckForNull String credentials, boolean skipTlsVerify) {
+        this(serviceAddress, namespace, caCertData, credentials, skipTlsVerify, DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT);
+    }
+
+    public KubernetesFactoryAdapter(String serviceAddress, String namespace, @CheckForNull String caCertData,
+                                    @CheckForNull String credentials, boolean skipTlsVerify, int connectTimeout, int readTimeout) {
         this.serviceAddress = serviceAddress;
+        this.namespace = namespace;
         this.caCertData = caCertData;
         this.credentials = credentials != null ? getCredentials(credentials) : null;
         this.skipTlsVerify = skipTlsVerify;
+        this.connectTimeout = connectTimeout;
+        this.readTimeout = readTimeout;
     }
 
     private StandardCredentials getCredentials(String credentials) {
@@ -57,7 +78,13 @@ public class KubernetesFactoryAdapter {
 
     public KubernetesClient createClient() throws NoSuchAlgorithmException, UnrecoverableKeyException,
             KeyStoreException, IOException, CertificateEncodingException {
-        ConfigBuilder builder = new ConfigBuilder().withMasterUrl(serviceAddress);
+        ConfigBuilder builder = new ConfigBuilder().withMasterUrl(serviceAddress)
+                .withRequestTimeout(readTimeout * 1000)
+                .withConnectionTimeout(connectTimeout * 1000);
+
+        if (namespace != null && !namespace.isEmpty()) {
+            builder.withNamespace(namespace);
+        }
         if (credentials != null) {
             if (credentials instanceof TokenProducer) {
                 final String token = ((TokenProducer)credentials).getToken(serviceAddress, caCertData, skipTlsVerify);
@@ -90,10 +117,10 @@ public class KubernetesFactoryAdapter {
     }
 
     private static String pemEncodeKey(Key key) {
-        return Base64.encodeBase64String(new StringBuilder()
-                .append("-----BEGIN PRIVATE KEY-----\n")
-                .append(Base64.encodeBase64String(key.getEncoded()))
-                .append("\n-----END PRIVATE KEY-----\n")
-                .toString().getBytes());
+        return Base64.encodeBase64String(new StringBuilder() //
+                .append("-----BEGIN PRIVATE KEY-----\n") //
+                .append(Base64.encodeBase64String(key.getEncoded())) //
+                .append("\n-----END PRIVATE KEY-----\n") //
+                .toString().getBytes(StandardCharsets.UTF_8));
     }
 }

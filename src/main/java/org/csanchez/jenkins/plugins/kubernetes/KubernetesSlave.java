@@ -12,14 +12,19 @@ import org.jvnet.localizer.ResourceBundleHolder;
 import org.kohsuke.stapler.DataBoundConstructor;
 
 import hudson.Extension;
+import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.JNLPLauncher;
-import hudson.slaves.NodeProperty;
 import hudson.slaves.OfflineCause;
+import hudson.slaves.RetentionStrategy;
+import io.fabric8.kubernetes.api.model.DoneablePod;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.ClientPodResource;
 
 /**
  * @author Carlos Sanchez carlos@apache.org
@@ -37,20 +42,34 @@ public class KubernetesSlave extends AbstractCloudSlave {
 
     // private final Pod pod;
 
-    private final KubernetesCloud cloud;
+    private transient final KubernetesCloud cloud;
 
-    @DataBoundConstructor
+    public KubernetesSlave(PodTemplate template, String nodeDescription, KubernetesCloud cloud, String labelStr)
+            throws Descriptor.FormException, IOException {
+
+        this(template, nodeDescription, cloud, labelStr, new OnceRetentionStrategy(cloud.getRetentionTimeout()));
+    }
+
+    @Deprecated
     public KubernetesSlave(PodTemplate template, String nodeDescription, KubernetesCloud cloud, Label label)
             throws Descriptor.FormException, IOException {
+        this(template, nodeDescription, cloud, label.toString(), new OnceRetentionStrategy(cloud.getRetentionTimeout())) ;
+    }
+
+    @DataBoundConstructor
+    public KubernetesSlave(PodTemplate template, String nodeDescription, KubernetesCloud cloud, String labelStr,
+                           RetentionStrategy rs)
+            throws Descriptor.FormException, IOException {
+
         super(getSlaveName(template),
                 nodeDescription,
                 template.getRemoteFs(),
                 1,
                 Node.Mode.NORMAL,
-                label == null ? null : label.toString(),
+                labelStr == null ? null : labelStr,
                 new JNLPLauncher(),
-                new OnceRetentionStrategy(cloud.getRetentionTimeout()),
-                Collections.<NodeProperty<Node>> emptyList());
+                rs,
+                template.getNodeProperties());
 
         // this.pod = pod;
         this.cloud = cloud;
@@ -78,24 +97,27 @@ public class KubernetesSlave extends AbstractCloudSlave {
     protected void _terminate(TaskListener listener) throws IOException, InterruptedException {
         LOGGER.log(Level.INFO, "Terminating Kubernetes instance for slave {0}", name);
 
-        if (toComputer() == null) {
+        Computer computer = toComputer();
+        if (computer == null) {
             LOGGER.log(Level.SEVERE, "Computer for slave is null: {0}", name);
             return;
         }
 
         try {
-            cloud.connect().pods().inNamespace(cloud.getNamespace()).withName(name).delete();
+            KubernetesClient client = cloud.connect();
+            ClientPodResource<Pod, DoneablePod> pods = client.pods().withName(name);
+            pods.delete();
             LOGGER.log(Level.INFO, "Terminated Kubernetes instance for slave {0}", name);
-            toComputer().disconnect(OfflineCause.create(new Localizable(HOLDER, "offline")));
+            computer.disconnect(OfflineCause.create(new Localizable(HOLDER, "offline")));
             LOGGER.log(Level.INFO, "Disconnected computer {0}", name);
         } catch (Exception e) {
-            LOGGER.log(Level.SEVERE, "Failure to terminate instance for slave " + name, e);
+            LOGGER.log(Level.SEVERE, "Failed to terminate pod for slave " + name, e);
         }
     }
 
     @Override
     public String toString() {
-        return String.format("KubernetesSlave name: %n", name);
+        return String.format("KubernetesSlave name: %s", name);
     }
 
     @Extension
