@@ -28,9 +28,8 @@ Nodes can be defined in a pipeline and then used
 ```groovy
 podTemplate(label: 'mypod', containers: [
     containerTemplate(name: 'maven', image: 'maven:3.3.9-jdk-8-alpine', ttyEnabled: true, command: 'cat'),
-    containerTemplate(name: 'golang', image: 'golang:1.6.3-alpine', ttyEnabled: true, command: 'cat')
-  ],
-  volumes: [secretVolume(secretName: 'shared-secrets', mountPath: '/etc/shared-secrets')]) {
+    containerTemplate(name: 'golang', image: 'golang:1.6.3', ttyEnabled: true, command: 'cat')
+  ]) {
 
     node ('mypod') {
         stage 'Get a Maven project'
@@ -73,6 +72,7 @@ Either way it provides access to the following fields:
 * **nodeSelector** The node selector of the pod.
 * **volumes** Volumes that are defined for the pod and are mounted by **ALL** containers.
 * **envVars*** Environment variables that are applied to **ALL** containers. 
+* **annotations** Annotations to apply to the pod.
 * **inheritFrom** List of one or more pod templates to inherit from *(more details below)*.
 
 The `containerTemplate` is a template of container that will be added to the pod. Again, its configurable via the user interface or via pipeline and allows you to set the following fields:
@@ -196,6 +196,10 @@ volumes: [
     hostPathVolume(mountPath: '/etc/mount4', hostPath: '/mnt/my-mount'),
     nfsVolume(mountPath: '/etc/mount5', serverAddress: '127.0.0.1', serverPath: '/', readOnly: true),
     persistentVolumeClaim(mountPath: '/etc/mount6', claimName: 'myClaim', readOnly: true)
+],
+annotations: [
+    podAnnotation(key: "my-key", value: "my-value")
+    ...
 ]) {
    ...
 }
@@ -206,19 +210,46 @@ volumes: [
 # Constraints
 
 Multiple containers can be defined in a pod.
-One of them must run the Jenkins JNLP agent service, with args `${computer.jnlpmac} ${computer.name}`,
-as it will be the container acting as Jenkins agent.
+One of them is automatically created with name `jnlp`, and runs the Jenkins JNLP agent service, with args `${computer.jnlpmac} ${computer.name}`,
+and will be the container acting as Jenkins agent. It can ve overridden by defining a container with the same name.
 
 Other containers must run a long running process, so the container does not exit. If the default entrypoint or command
 just runs something and exit then it should be overriden with something like `cat` with `ttyEnabled: true`.
 
 
+# Over provisioning flags
+
+By default, Jenkins spawns slaves conservatively. Say, if there are 2 builds in queue, it won't spawn 2 executors immediately.
+It will spawn one executor and wait for sometime for the first executor to be freed before deciding to spawn the second executor.
+Jenkins makes sure every executor it spawns is utilized to the maximum.
+If you want to override this behaviour and spawn an executor for each build in queue immediately without waiting,
+you can use these flags during Jenkins startup:
+`-Dhudson.slaves.NodeProvisioner.MARGIN=50 -Dhudson.slaves.NodeProvisioner.MARGIN0=0.85`
+
+
+# Configuration on minikube
+
+Create and start [minikube](https://github.com/kubernetes/minikube)
+
+The client certificate needs to be converted to PKCS, will need a password
+
+    openssl pkcs12 -export -out ~/.minikube/minikube.pfx -inkey ~/.minikube/apiserver.key -in ~/.minikube/apiserver.crt -certfile ~/.minikube/ca.crt -passout pass:secret
+
+Validate that the certificates work
+
+    curl --cacert ~/.minikube/ca.crt --cert ~/.minikube/minikube.pfx:secret https://$(minikube ip):8443
+
+Add a Jenkins credential of type certificate, upload it from `~/.minikube/minikube.pfx`, password `secret`
+
+Fill *Kubernetes server certificate key* with the contents of `~/.minikube/ca.crt`
+
+
 # Configuration on Google Container Engine
 
 Create a cluster 
-```
+
     gcloud container clusters create jenkins --num-nodes 1 --machine-type g1-small
-```
+
 and note the admin password and server certitifate.
 
 Or use Google Developer Console to create a Container Engine cluster, then run 
@@ -232,7 +263,7 @@ the last command will output kubernetes cluster configuration including API serv
 # Debugging
 
 To inspect the json messages sent back and forth to the Kubernetes API server you can configure
-a new [Jenkins log recorder](https://wiki.jenkins-ci.org/display/JENKINS/Logging) for `org.apache.http`
+a new [Jenkins log recorder](https://wiki.jenkins-ci.org/display/JENKINS/Logging) for `okhttp3`
 at `DEBUG` level.
 
 
@@ -259,11 +290,20 @@ A local testing cluster with one node can be created with [minukube](https://git
 
     minikube start
 
+Set the correct permissions for the host mounted volume
+
+    minikube ssh
+    sudo mkdir -p /data/kubernetes-plugin-jenkins
+    sudo chown 1000:1000 /data/kubernetes-plugin-jenkins
+
 Then create the Jenkins ReplicationController and Service with
 
     kubectl create -f ./src/main/kubernetes/minikube.yml
     kubectl config set-context $(kubectl config current-context) --namespace=kubernetes-plugin
 
+Get the url to connect to with
+
+    minikube service jenkins --namespace kubernetes-plugin --url
 
 ## Running in Google Container Engine GKE
 

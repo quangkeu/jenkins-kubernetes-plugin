@@ -1,6 +1,9 @@
 package org.csanchez.jenkins.plugins.kubernetes;
 
+import static org.csanchez.jenkins.plugins.kubernetes.PodTemplateUtils.*;
+
 import java.io.IOException;
+import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.nio.file.Paths;
 import java.security.KeyStoreException;
@@ -24,10 +27,10 @@ import java.util.stream.Collectors;
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 
-import hudson.model.labels.LabelAtom;
 import org.apache.commons.lang.StringUtils;
-import org.csanchez.jenkins.plugins.kubernetes.pipeline.PodTemplateStepExecution;
 import org.csanchez.jenkins.plugins.kubernetes.volumes.PodVolume;
+import org.csanchez.jenkins.plugins.kubernetes.pipeline.PodTemplateStepExecution;
+import org.jenkinsci.plugins.durabletask.executors.OnceRetentionStrategy;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -52,6 +55,7 @@ import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.labels.LabelAtom;
 import hudson.security.ACL;
 import hudson.slaves.Cloud;
 import hudson.slaves.CloudRetentionStrategy;
@@ -72,10 +76,11 @@ import io.fabric8.kubernetes.api.model.Volume;
 import io.fabric8.kubernetes.api.model.VolumeBuilder;
 import io.fabric8.kubernetes.api.model.VolumeMount;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClientException;
+import io.fabric8.kubernetes.client.dsl.LogWatch;
+import io.fabric8.kubernetes.client.dsl.PrettyLoggable;
 import jenkins.model.Jenkins;
 import jenkins.model.JenkinsLocationConfiguration;
-import static org.csanchez.jenkins.plugins.kubernetes.PodTemplateUtils.substituteEnv;
-import org.jenkinsci.plugins.durabletask.executors.OnceRetentionStrategy;
 
 /**
  * Kubernetes cloud provider.
@@ -92,7 +97,7 @@ public class KubernetesCloud extends Cloud {
     private static final String DEFAULT_ID = "jenkins/slave-default";
     private static final String WORKSPACE_VOLUME_NAME = "workspace-volume";
 
-    private static final String JNLP_NAME = "jnlp";
+    public static final String JNLP_NAME = "jnlp";
     private static final String DEFAULT_JNLP_ARGUMENTS = "${computer.jnlpmac} ${computer.name}";
 
     private static final String DEFAULT_JNLP_IMAGE = System
@@ -106,6 +111,8 @@ public class KubernetesCloud extends Cloud {
 
     /** Default timeout for idle workers that don't correctly indicate exit. */
     private static final int DEFAULT_RETENTION_TIMEOUT_MINUTES = 5;
+
+    private String defaultsProviderTemplate;
 
     private List<PodTemplate> templates = new ArrayList<PodTemplate>();
     private String serverUrl;
@@ -159,6 +166,15 @@ public class KubernetesCloud extends Cloud {
     @DataBoundSetter
     public void setRetentionTimeout(int retentionTimeout) {
         this.retentionTimeout = retentionTimeout;
+    }
+
+    public String getDefaultsProviderTemplate() {
+        return defaultsProviderTemplate;
+    }
+
+    @DataBoundSetter
+    public void setDefaultsProviderTemplate(String defaultsProviderTemplate) {
+        this.defaultsProviderTemplate = defaultsProviderTemplate;
     }
 
     public List<PodTemplate> getTemplates() {
@@ -304,39 +320,51 @@ public class KubernetesCloud extends Cloud {
 
 
     private Container createContainer(KubernetesSlave slave, ContainerTemplate containerTemplate, Collection<PodEnvVar> globalEnvVars, Collection<VolumeMount> volumeMounts) {
-        List<EnvVar> env = new ArrayList<EnvVar>(3);
-        // always add some env vars
-        env.add(new EnvVar("JENKINS_SECRET", slave.getComputer().getJnlpMac(), null));
-        env.add(new EnvVar("JENKINS_NAME", slave.getComputer().getName(), null));
+        // Last-write wins map of environment variable names to values
+        HashMap<String, String> env = new HashMap<>();
+
+        // Add some default env vars for Jenkins
+        env.put("JENKINS_SECRET", slave.getComputer().getJnlpMac());
+        env.put("JENKINS_NAME", slave.getComputer().getName());
+
         JenkinsLocationConfiguration locationConfiguration = JenkinsLocationConfiguration.get();
         String locationConfigurationUrl = locationConfiguration != null ? locationConfiguration.getUrl() : null;
-        env.add(new EnvVar("JENKINS_LOCATION_URL", locationConfigurationUrl, null));
         String url = StringUtils.isBlank(jenkinsUrl) ? locationConfigurationUrl : jenkinsUrl;
-        env.add(new EnvVar("JENKINS_URL", url, null));
-        if (!StringUtils.isBlank(jenkinsTunnel)) {
-            env.add(new EnvVar("JENKINS_TUNNEL", jenkinsTunnel, null));
-        }
 
         if (url == null) {
             throw new IllegalStateException("Jenkins URL is null while computing JNLP url");
         }
-        url = url.endsWith("/") ? url : url + "/";
-        env.add(new EnvVar("JENKINS_JNLP_URL", url + slave.getComputer().getUrl() + "slave-agent.jnlp", null));
 
-        if (globalEnvVars != null) {
-            for (PodEnvVar podEnvVar : globalEnvVars) {
-                env.add(new EnvVar(podEnvVar.getKey(), substituteEnv(podEnvVar.getValue()), null));
-            }
+        env.put("JENKINS_LOCATION_URL", locationConfigurationUrl);
+        env.put("JENKINS_URL", url);
+        if (!StringUtils.isBlank(jenkinsTunnel)) {
+            env.put("JENKINS_TUNNEL", jenkinsTunnel);
         }
-        if (containerTemplate.getEnvVars() != null) {
-            for (ContainerEnvVar containerEnvVar : containerTemplate.getEnvVars()) {
-                env.add(new EnvVar(containerEnvVar.getKey(), substituteEnv(containerEnvVar.getValue()), null));
-            }
-        }
+
+        url = url.endsWith("/") ? url : url + "/";
+        env.put("JENKINS_JNLP_URL", url + slave.getComputer().getUrl() + "slave-agent.jnlp");
+
         // Running on OpenShift Enterprise, security concerns force use of arbitrary user ID
         // As a result, container is running without a home set for user, resulting into using `/` for some tools,
         // and `?` for java build tools. So we force HOME to a safe location.
-        env.add(new EnvVar("HOME", containerTemplate.getWorkingDir(), null));
+        env.put("HOME", containerTemplate.getWorkingDir());
+
+        if (globalEnvVars != null) {
+            for (PodEnvVar podEnvVar : globalEnvVars) {
+                env.put(podEnvVar.getKey(), substituteEnv(podEnvVar.getValue()));
+            }
+        }
+
+        if (containerTemplate.getEnvVars() != null) {
+            for (ContainerEnvVar containerEnvVar : containerTemplate.getEnvVars()) {
+                env.put(containerEnvVar.getKey(), substituteEnv(containerEnvVar.getValue()));
+            }
+        }
+
+        // Convert our env map to an array
+        EnvVar[] envVars = env.entrySet().stream()
+                .map(entry -> new EnvVar(entry.getKey(), entry.getValue(), null))
+                .toArray(size -> new EnvVar[size]);
 
         List<String> arguments = Strings.isNullOrEmpty(containerTemplate.getArgs()) ? Collections.emptyList()
                 : parseDockerCommand(containerTemplate.getArgs() //
@@ -345,21 +373,22 @@ public class KubernetesCloud extends Cloud {
 
 
         List<VolumeMount> containerMounts = new ArrayList<>(volumeMounts);
+
         if (!Strings.isNullOrEmpty(containerTemplate.getWorkingDir())
                 && !PodVolume.volumeMountExists(containerTemplate.getWorkingDir(), volumeMounts)) {
-            containerMounts.add(new VolumeMount(containerTemplate.getWorkingDir(), WORKSPACE_VOLUME_NAME, false));
+            containerMounts.add(new VolumeMount(containerTemplate.getWorkingDir(), WORKSPACE_VOLUME_NAME, false, null));
         }
 
         return new ContainerBuilder()
                 .withName(substituteEnv(containerTemplate.getName()))
                 .withImage(substituteEnv(containerTemplate.getImage()))
-                .withImagePullPolicy(containerTemplate.isAlwaysPullImage() != null && containerTemplate.isAlwaysPullImage() ? "Always" : "IfNotPresent")
+                .withImagePullPolicy(containerTemplate.isAlwaysPullImage() ? "Always" : "IfNotPresent")
                 .withNewSecurityContext()
                     .withPrivileged(containerTemplate.isPrivileged())
                 .endSecurityContext()
                 .withWorkingDir(substituteEnv(containerTemplate.getWorkingDir()))
                 .withVolumeMounts(containerMounts.toArray(new VolumeMount[containerMounts.size()]))
-                .addToEnv(env.toArray(new EnvVar[env.size()]))
+                .addToEnv(envVars)
                 .withCommand(parseDockerCommand(containerTemplate.getCommand()))
                 .withArgs(arguments)
                 .withTty(containerTemplate.isTtyEnabled())
@@ -371,8 +400,8 @@ public class KubernetesCloud extends Cloud {
     }
 
 
-    private Pod getPodTemplate(KubernetesSlave slave, Label label) {
-        final PodTemplate template = PodTemplateUtils.unwrap(getTemplate(label), templates);
+    private Pod getPodTemplate(KubernetesSlave slave, @CheckForNull Label label) {
+        final PodTemplate template = PodTemplateUtils.unwrap(getTemplate(label), defaultsProviderTemplate, templates);
         if (template == null) {
             return null;
         }
@@ -387,13 +416,19 @@ public class KubernetesCloud extends Cloud {
             //We need to normalize the path or we can end up in really hard to debug issues.
             final String mountPath = substituteEnv(Paths.get(volume.getMountPath()).normalize().toString());
             if (!volumeMounts.containsKey(mountPath)) {
-                volumeMounts.put(mountPath, new VolumeMount(mountPath, volumeName, false));
+                volumeMounts.put(mountPath, new VolumeMount(mountPath, volumeName, false, null));
                 volumes.add(volume.buildVolume(volumeName));
                 i++;
             }
         }
-        // add an empty volume to share the workspace across the pod
-        volumes.add(new VolumeBuilder().withName(WORKSPACE_VOLUME_NAME).withNewEmptyDir("").build());
+
+        if (template.getWorkspaceVolume() != null) {
+            volumes.add(template.getWorkspaceVolume().buildVolume(WORKSPACE_VOLUME_NAME));
+        } else {
+            // add an empty volume to share the workspace across the pod
+            volumes.add(new VolumeBuilder().withName(WORKSPACE_VOLUME_NAME).withNewEmptyDir("").build());
+        }
+
         Map<String, Container> containers = new HashMap<>();
 
         for (ContainerTemplate containerTemplate : template.getContainers()) {
@@ -407,6 +442,8 @@ public class KubernetesCloud extends Cloud {
             containers.put(JNLP_NAME, createContainer(slave, containerTemplate, template.getEnvVars(), volumeMounts.values()));
         }
 
+        List<LocalObjectReference> imagePullSecrets = template.getImagePullSecrets().stream()
+                .map((x) -> x.toLocalObjectReference()).collect(Collectors.toList());
         return new PodBuilder()
                 .withNewMetadata()
                     .withName(substituteEnv(slave.getNodeName()))
@@ -416,7 +453,7 @@ public class KubernetesCloud extends Cloud {
                 .withNewSpec()
                     .withVolumes(volumes)
                     .withServiceAccount(substituteEnv(template.getServiceAccount()))
-                    .withImagePullSecrets(template.getImagePullSecrets().toArray(new LocalObjectReference[template.getImagePullSecrets().size()]))
+                    .withImagePullSecrets(imagePullSecrets)
                     .withContainers(containers.values().toArray(new Container[containers.size()]))
                     .withNodeSelector(getNodeSelectorMap(template.getNodeSelector()))
                     .withRestartPolicy("Never")
@@ -499,7 +536,7 @@ public class KubernetesCloud extends Cloud {
     }
 
     @Override
-    public synchronized Collection<NodeProvisioner.PlannedNode> provision(final Label label, final int excessWorkload) {
+    public synchronized Collection<NodeProvisioner.PlannedNode> provision(@CheckForNull final Label label, final int excessWorkload) {
         try {
 
             LOGGER.log(Level.INFO, "Excess workload after pending Spot instances: " + excessWorkload);
@@ -523,21 +560,62 @@ public class KubernetesCloud extends Cloud {
                 }
             }
             return r;
+        } catch (KubernetesClientException e) {
+            Throwable cause = e.getCause();
+            if (cause != null) {
+                if (cause instanceof SocketTimeoutException) {
+                    LOGGER.log(Level.WARNING, "Failed to count the # of live instances on Kubernetes: {0}",
+                            cause.getMessage());
+                } else {
+                    LOGGER.log(Level.WARNING, "Failed to count the # of live instances on Kubernetes", cause);
+                }
+            } else {
+                LOGGER.log(Level.WARNING, "Failed to count the # of live instances on Kubernetes", e);
+            }
         } catch (Exception e) {
             LOGGER.log(Level.WARNING, "Failed to count the # of live instances on Kubernetes", e);
-            return Collections.emptyList();
         }
+        return Collections.emptyList();
     }
 
     private class ProvisioningCallback implements Callable<Node> {
+        @Nonnull
         private final KubernetesCloud cloud;
+        @Nonnull
         private final PodTemplate t;
+        @CheckForNull
         private final Label label;
 
-        public ProvisioningCallback(KubernetesCloud cloud, PodTemplate t, Label label) {
+        public ProvisioningCallback(@Nonnull KubernetesCloud cloud, @Nonnull PodTemplate t, @CheckForNull Label label) {
             this.cloud = cloud;
             this.t = t;
             this.label = label;
+        }
+
+        /**
+         * Log the last lines of containers logs
+         */
+        private void logLastLines(List<ContainerStatus> containers, String podId, KubernetesSlave slave,
+                Map<String, Integer> errors) {
+            for (ContainerStatus containerStatus : containers) {
+                String containerName = containerStatus.getName();
+
+                try {
+                    PrettyLoggable<String, LogWatch> tailingLines = connect().pods().withName(podId)
+                            .inContainer(containerStatus.getName()).tailingLines(20);
+                    String log = tailingLines.getLog();
+                    if (!StringUtils.isBlank(log)) {
+                        String msg = errors != null ? String.format(" exited with error %s", errors.get(containerName))
+                                : "";
+                        LOGGER.log(Level.SEVERE,
+                                "Error in provisioning; slave={0}, template={1}. Container {2}{3}. Logs: {4}",
+                                new Object[] { slave, t, containerName, msg, tailingLines.getLog() });
+                    }
+                } catch (UnrecoverableKeyException | CertificateEncodingException | NoSuchAlgorithmException
+                        | KeyStoreException | IOException e) {
+                    LOGGER.log(Level.SEVERE, "Could not get logs for pod " + podId, e);
+                }
+            }
         }
 
         public Node call() throws Exception {
@@ -549,7 +627,8 @@ public class KubernetesCloud extends Cloud {
                 } else {
                     retentionStrategy = new CloudRetentionStrategy(t.getIdleMinutes());
                 }
-                slave = new KubernetesSlave(t, t.getName(), cloud, t.getLabel(), retentionStrategy);
+                slave = new KubernetesSlave(t, t.getName(), cloud.name, t.getLabel(), retentionStrategy);
+                LOGGER.log(Level.FINER, "Adding Jenkins node: {0}", slave.getNodeName());
                 Jenkins.getActiveInstance().addNode(slave);
 
                 Pod pod = getPodTemplate(slave, label);
@@ -566,6 +645,8 @@ public class KubernetesCloud extends Cloud {
                 int i = 0;
                 int j = 100; // wait 600 seconds
 
+                List<ContainerStatus> containerStatuses = null;
+
                 // wait for Pod to be running
                 for (; i < j; i++) {
                     LOGGER.log(Level.INFO, "Waiting for Pod to be scheduled ({1}/{2}): {0}", new Object[] {podId, i, j});
@@ -575,7 +656,7 @@ public class KubernetesCloud extends Cloud {
                         throw new IllegalStateException("Pod no longer exists: " + podId);
                     }
 
-                    List<ContainerStatus> containerStatuses = pod.getStatus().getContainerStatuses();
+                    containerStatuses = pod.getStatus().getContainerStatuses();
                     List<ContainerStatus> terminatedContainers = new ArrayList<>();
                     Boolean allContainersAreReady = true;
                     for (ContainerStatus info : containerStatuses) {
@@ -597,6 +678,9 @@ public class KubernetesCloud extends Cloud {
                     if (!terminatedContainers.isEmpty()) {
                         Map<String, Integer> errors = terminatedContainers.stream().collect(Collectors.toMap(
                                 ContainerStatus::getName, (info) -> info.getState().getTerminated().getExitCode()));
+
+                        // Print the last lines of failed containers
+                        logLastLines(terminatedContainers, podId, slave, errors);
                         throw new IllegalStateException("Containers are terminated with exit codes: " + errors);
                     }
 
@@ -610,7 +694,7 @@ public class KubernetesCloud extends Cloud {
                 }
                 String status = pod.getStatus().getPhase();
                 if (!validStates.contains(status)) {
-                    throw new IllegalStateException("Container is not running after " + j + " attempts: " + status);
+                    throw new IllegalStateException("Container is not running after " + j + " attempts, status: " + status);
                 }
 
                 // now wait for slave to be online
@@ -626,13 +710,19 @@ public class KubernetesCloud extends Cloud {
                     Thread.sleep(1000);
                 }
                 if (!slave.getComputer().isOnline()) {
-                    throw new IllegalStateException("Slave is not connected after " + j + " attempts: " + status);
+                    if (containerStatuses != null) {
+                        logLastLines(containerStatuses, podId, slave, null);
+                    }
+                    throw new IllegalStateException("Slave is not connected after " + j + " attempts, status: " + status);
                 }
 
                 return slave;
             } catch (Throwable ex) {
                 LOGGER.log(Level.SEVERE, "Error in provisioning; slave={0}, template={1}", new Object[] { slave, t });
-                ex.printStackTrace();
+                if (slave != null) {
+                    LOGGER.log(Level.FINER, "Removing Jenkins node: {0}", slave.getNodeName());
+                    Jenkins.getInstance().removeNode(slave);
+                }
                 throw Throwables.propagate(ex);
             }
         }
@@ -642,7 +732,7 @@ public class KubernetesCloud extends Cloud {
      * Check not too many already running.
      *
      */
-    private boolean addProvisionedSlave(PodTemplate template, Label label) throws Exception {
+    private boolean addProvisionedSlave(@Nonnull PodTemplate template, @CheckForNull Label label) throws Exception {
         if (containerCap == 0) {
             return true;
         }
@@ -655,24 +745,24 @@ public class KubernetesCloud extends Cloud {
         PodList namedList = client.pods().withLabels(labelsMap).list();
         List<Pod> namedListItems = namedList.getItems();
 
-        if (slaveListItems != null && containerCap < slaveListItems.size()) {
+        if (slaveListItems != null && containerCap <= slaveListItems.size()) {
             LOGGER.log(Level.INFO, "Total container cap of {0} reached, not provisioning: {1} running in namespace {2}",
                     new Object[] { containerCap, slaveListItems.size(), client.getNamespace() });
             return false;
         }
 
-        if (namedListItems != null && slaveListItems != null && template.getInstanceCap() < namedListItems.size()) {
+        if (namedListItems != null && slaveListItems != null && template.getInstanceCap() <= namedListItems.size()) {
             LOGGER.log(Level.INFO,
-                    "Template instance cap of {0} reached for template {1}, not provisioning: {2} running in namespace {3} with label {4}",
+                    "Template instance cap of {0} reached for template {1}, not provisioning: {2} running in namespace '{3}' with label '{4}'",
                     new Object[] { template.getInstanceCap(), template.getName(), slaveListItems.size(),
-                            client.getNamespace(), label.toString() });
+                            client.getNamespace(), label == null ? "" : label.toString() });
             return false; // maxed out
         }
         return true;
     }
 
     @Override
-    public boolean canProvision(Label label) {
+    public boolean canProvision(@CheckForNull Label label) {
         return getTemplate(label) != null;
     }
 
@@ -681,8 +771,8 @@ public class KubernetesCloud extends Cloud {
      * @param label label to look for in templates
      * @return the template
      */
-    public PodTemplate getTemplate(Label label) {
-        return PodTemplateUtils.getTemplate(label, templates);
+    public PodTemplate getTemplate(@CheckForNull Label label) {
+        return PodTemplateUtils.getTemplateByLabel(label, templates);
     }
 
     /**
@@ -690,7 +780,7 @@ public class KubernetesCloud extends Cloud {
      * @param label label to look for in templates
      * @return list of matching templates
      */
-    public ArrayList<PodTemplate> getMatchingTemplates(Label label) {
+    public ArrayList<PodTemplate> getMatchingTemplates(@CheckForNull Label label) {
         ArrayList<PodTemplate> podList = new ArrayList<PodTemplate>();
         for (PodTemplate t : templates) {
             if (label == null || label.matches(t.getLabelSet())) {
@@ -732,13 +822,19 @@ public class KubernetesCloud extends Cloud {
                                                @QueryParameter int connectionTimeout,
                                                @QueryParameter int readTimeout) throws Exception {
 
-            KubernetesClient client = new KubernetesFactoryAdapter(serverUrl.toExternalForm(),
-                    namespace,
-                    Util.fixEmpty(serverCertificate), Util.fixEmpty(credentialsId), skipTlsVerify, connectionTimeout, readTimeout)
-                    .createClient();
+            try {
+                KubernetesClient client = new KubernetesFactoryAdapter(serverUrl.toExternalForm(), namespace,
+                        Util.fixEmpty(serverCertificate), Util.fixEmpty(credentialsId), skipTlsVerify,
+                        connectionTimeout, readTimeout).createClient();
 
-            client.pods().list();
-            return FormValidation.ok("Connection successful");
+                client.pods().list();
+                return FormValidation.ok("Connection successful");
+            } catch (KubernetesClientException e) {
+                return FormValidation.error("Error connecting to %s: %s", serverUrl,
+                        e.getCause() == null ? e.getMessage() : e.getCause().getMessage());
+            } catch (Exception e) {
+                return FormValidation.error("Error connecting to %s: %s", serverUrl, e.getMessage());
+            }
         }
 
         public ListBoxModel doFillCredentialsIdItems(@QueryParameter URL serverUrl) {

@@ -22,50 +22,20 @@
  * THE SOFTWARE.
  */
 
-package org.csanchez.jenkins.plugins.kubernetes.volumes;
+package org.csanchez.jenkins.plugins.kubernetes.volumes.workspace;
 
-import org.jenkinsci.Symbol;
-import org.kohsuke.stapler.DataBoundConstructor;
+import java.io.Serializable;
 
-import hudson.Extension;
-import hudson.model.Descriptor;
+import hudson.model.AbstractDescribableImpl;
 import io.fabric8.kubernetes.api.model.Volume;
-import io.fabric8.kubernetes.api.model.VolumeBuilder;
 
-public class SecretVolume extends PodVolume {
+/**
+ * Base class for all Kubernetes volume types
+ */
+public abstract class WorkspaceVolume extends AbstractDescribableImpl<WorkspaceVolume> implements Serializable {
 
-    private String mountPath;
-    private String secretName;
+    private static final long serialVersionUID = 5367004248055474414L;
 
-    @DataBoundConstructor
-    public SecretVolume(String mountPath, String secretName) {
-        this.mountPath = mountPath;
-        this.secretName = secretName;
-    }
-
-    @Override
-    public Volume buildVolume(String volumeName) {
-        return new VolumeBuilder()
-                .withName(volumeName)
-                .withNewSecret().withSecretName(getSecretName()).endSecret()
-                .build();
-    }
-
-    public String getSecretName() {
-        return secretName;
-    }
-
-    @Override
-    public String getMountPath() {
-        return mountPath;
-    }
-
-    @Extension
-    @Symbol("secretVolume")
-    public static class DescriptorImpl extends Descriptor<PodVolume> {
-        @Override
-        public String getDisplayName() {
-            return "Secret Volume";
-        }
-    }
+    // Builds a Volume model with the given name.
+    public abstract Volume buildVolume(String volumeName);
 }

@@ -22,7 +22,7 @@
  * THE SOFTWARE.
  */
 
-package org.csanchez.jenkins.plugins.kubernetes.volumes;
+package org.csanchez.jenkins.plugins.kubernetes.volumes.workspace;
 
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -32,40 +32,31 @@ import hudson.model.Descriptor;
 import io.fabric8.kubernetes.api.model.Volume;
 import io.fabric8.kubernetes.api.model.VolumeBuilder;
 
-public class SecretVolume extends PodVolume {
-
-    private String mountPath;
-    private String secretName;
+public class HostPathWorkspaceVolume extends WorkspaceVolume {
+    private String hostPath;
 
     @DataBoundConstructor
-    public SecretVolume(String mountPath, String secretName) {
-        this.mountPath = mountPath;
-        this.secretName = secretName;
+    public HostPathWorkspaceVolume(String hostPath) {
+        this.hostPath = hostPath;
     }
 
-    @Override
     public Volume buildVolume(String volumeName) {
         return new VolumeBuilder()
                 .withName(volumeName)
-                .withNewSecret().withSecretName(getSecretName()).endSecret()
+                .withNewHostPath(getHostPath())
                 .build();
     }
 
-    public String getSecretName() {
-        return secretName;
-    }
-
-    @Override
-    public String getMountPath() {
-        return mountPath;
+    public String getHostPath() {
+        return hostPath;
     }
 
     @Extension
-    @Symbol("secretVolume")
-    public static class DescriptorImpl extends Descriptor<PodVolume> {
+    @Symbol("hostPathWorkspaceVolume")
+    public static class DescriptorImpl extends Descriptor<WorkspaceVolume> {
         @Override
         public String getDisplayName() {
-            return "Secret Volume";
+            return "Host Path Workspace Volume";
         }
     }
 }

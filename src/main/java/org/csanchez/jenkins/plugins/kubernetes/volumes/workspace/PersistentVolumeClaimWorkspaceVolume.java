@@ -22,7 +22,10 @@
  * THE SOFTWARE.
  */
 
-package org.csanchez.jenkins.plugins.kubernetes.volumes;
+package org.csanchez.jenkins.plugins.kubernetes.volumes.workspace;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
 
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -32,40 +35,43 @@ import hudson.model.Descriptor;
 import io.fabric8.kubernetes.api.model.Volume;
 import io.fabric8.kubernetes.api.model.VolumeBuilder;
 
-public class SecretVolume extends PodVolume {
-
-    private String mountPath;
-    private String secretName;
+public class PersistentVolumeClaimWorkspaceVolume extends WorkspaceVolume {
+    private String claimName;
+    @CheckForNull
+    private Boolean readOnly;
 
     @DataBoundConstructor
-    public SecretVolume(String mountPath, String secretName) {
-        this.mountPath = mountPath;
-        this.secretName = secretName;
+    public PersistentVolumeClaimWorkspaceVolume(String claimName, Boolean readOnly) {
+        this.claimName = claimName;
+        this.readOnly = readOnly;
+    }
+
+    public String getClaimName() {
+        return claimName;
+    }
+
+    @Nonnull
+    public Boolean getReadOnly() {
+        return readOnly != null && readOnly;
     }
 
     @Override
     public Volume buildVolume(String volumeName) {
         return new VolumeBuilder()
                 .withName(volumeName)
-                .withNewSecret().withSecretName(getSecretName()).endSecret()
+                .withNewPersistentVolumeClaim()
+                    .withClaimName(getClaimName())
+                    .withReadOnly(getReadOnly())
+                .and()
                 .build();
     }
 
-    public String getSecretName() {
-        return secretName;
-    }
-
-    @Override
-    public String getMountPath() {
-        return mountPath;
-    }
-
     @Extension
-    @Symbol("secretVolume")
-    public static class DescriptorImpl extends Descriptor<PodVolume> {
+    @Symbol("persistentVolumeClaimWorkspaceVolume")
+    public static class DescriptorImpl extends Descriptor<WorkspaceVolume> {
         @Override
         public String getDisplayName() {
-            return "Secret Volume";
+            return "Persistent Volume Claim Workspace Volume";
         }
     }
 }

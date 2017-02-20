@@ -22,7 +22,10 @@
  * THE SOFTWARE.
  */
 
-package org.csanchez.jenkins.plugins.kubernetes.volumes;
+package org.csanchez.jenkins.plugins.kubernetes.volumes.workspace;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
 
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -32,40 +35,45 @@ import hudson.model.Descriptor;
 import io.fabric8.kubernetes.api.model.Volume;
 import io.fabric8.kubernetes.api.model.VolumeBuilder;
 
-public class SecretVolume extends PodVolume {
-
-    private String mountPath;
-    private String secretName;
+public class NfsWorkspaceVolume extends WorkspaceVolume {
+    private String serverAddress;
+    private String serverPath;
+    @CheckForNull
+    private Boolean readOnly;
 
     @DataBoundConstructor
-    public SecretVolume(String mountPath, String secretName) {
-        this.mountPath = mountPath;
-        this.secretName = secretName;
+    public NfsWorkspaceVolume(String serverAddress, String serverPath, Boolean readOnly) {
+        this.serverAddress = serverAddress;
+        this.serverPath = serverPath;
+        this.readOnly = readOnly;
     }
 
-    @Override
     public Volume buildVolume(String volumeName) {
         return new VolumeBuilder()
                 .withName(volumeName)
-                .withNewSecret().withSecretName(getSecretName()).endSecret()
+                .withNewNfs(getServerPath(), getReadOnly(), getServerAddress())
                 .build();
     }
 
-    public String getSecretName() {
-        return secretName;
+    public String getServerAddress() {
+        return serverAddress;
     }
 
-    @Override
-    public String getMountPath() {
-        return mountPath;
+    public String getServerPath() {
+        return serverPath;
+    }
+
+    @Nonnull
+    public Boolean getReadOnly() {
+        return readOnly != null && readOnly;
     }
 
     @Extension
-    @Symbol("secretVolume")
-    public static class DescriptorImpl extends Descriptor<PodVolume> {
+    @Symbol("nfsWorkspaceVolume")
+    public static class DescriptorImpl extends Descriptor<WorkspaceVolume> {
         @Override
         public String getDisplayName() {
-            return "Secret Volume";
+            return "NFS Workspace Volume";
         }
     }
 }

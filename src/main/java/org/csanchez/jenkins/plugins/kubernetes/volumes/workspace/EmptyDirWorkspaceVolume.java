@@ -22,7 +22,10 @@
  * THE SOFTWARE.
  */
 
-package org.csanchez.jenkins.plugins.kubernetes.volumes;
+package org.csanchez.jenkins.plugins.kubernetes.volumes.workspace;
+
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
 
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -32,40 +35,39 @@ import hudson.model.Descriptor;
 import io.fabric8.kubernetes.api.model.Volume;
 import io.fabric8.kubernetes.api.model.VolumeBuilder;
 
-public class SecretVolume extends PodVolume {
+public class EmptyDirWorkspaceVolume extends WorkspaceVolume {
 
-    private String mountPath;
-    private String secretName;
+    private static final String DEFAULT_MEDIUM = "";
+    private static final String MEMORY_MEDIUM = "Memory";
+
+    @CheckForNull
+    private Boolean memory;
 
     @DataBoundConstructor
-    public SecretVolume(String mountPath, String secretName) {
-        this.mountPath = mountPath;
-        this.secretName = secretName;
+    public EmptyDirWorkspaceVolume(Boolean memory) {
+        this.memory = memory;
+    }
+
+    public String getMedium() {
+        return getMemory() ? MEMORY_MEDIUM : DEFAULT_MEDIUM;
+    }
+
+    @Nonnull
+    public Boolean getMemory() {
+        return memory != null && memory;
     }
 
     @Override
     public Volume buildVolume(String volumeName) {
-        return new VolumeBuilder()
-                .withName(volumeName)
-                .withNewSecret().withSecretName(getSecretName()).endSecret()
-                .build();
-    }
-
-    public String getSecretName() {
-        return secretName;
-    }
-
-    @Override
-    public String getMountPath() {
-        return mountPath;
+        return new VolumeBuilder().withName(volumeName).withNewEmptyDir(getMedium()).build();
     }
 
     @Extension
-    @Symbol("secretVolume")
-    public static class DescriptorImpl extends Descriptor<PodVolume> {
+    @Symbol("emptyDirWorkspaceVolume")
+    public static class DescriptorImpl extends Descriptor<WorkspaceVolume> {
         @Override
         public String getDisplayName() {
-            return "Secret Volume";
+            return "Empty Dir Workspace Volume";
         }
     }
 }
